@@ -1,0 +1,110 @@
+﻿// **Shelly Script für die Nulleinspeisung über OpenDTU in Battery mit Flole HM-WR**
+// **läuft direkt auf Shelly Gen. 3 Geräten **
+// ** ohne jegliche Gewährleistung **
+// ** Danke an alle die geholfen haben, Solaa 2025 **
+let sourceUrl = "http://192.168.179.xxx/api/livedata/status/"; //DTU-IP zur Abfrage der OpenDTU Daten 
+let limitstatusUrl = "http://192.168.179.xxx/api/limit/status/"; // DTU-IP Abfrage des Inverter Status - nicht relevant für die Funktion des Scripts
+let openDTUUrl = "http://192.168.179.xxx/api/limit/config"; // DTU-IP OpenDTU Adresse zum setzen des Limits
+let serial = "11418421xxx"; // Seriennummer deines HM-Wechselrichters
+let max_power = 1000; // Max. Leistung deines HM-WR 
+let Kp = 1.0; // Regelfaktor falls gewünscht
+let limit_type = 1; // Falls ein bestimmter Limit-Typ notwendig ist (1 ist das temporär Limit)
+let username = "admin"; // User Name halt
+let password = "openDTU42"; // Open-DTU Passwort halt
+// Base64-kodierte Authentifizierung für OpenDTU
+let auth = "Basic "+ btoa(username + ":"+ password); 
+// **Live-Daten abrufen**
+function fetchDataAndSend() {
+    Shelly.call("HTTP.GET", { url: sourceUrl }, function (response) {
+        if (response.code >= 200 &&response.code <300) {
+            let data;
+            try {
+                data = JSON.parse(response.body);
+            } catch (e) {
+                print("Fehler beim JSON-Parsing:", e);
+                return;
+            }
+            if (!data || !data.inverters || data.inverters.length === 0 || 
+                !data.power_meter || !data.power_meter.Power) {
+                print("Ungültige oder fehlende Daten in API-Antwort.");
+                return;
+            }
+            let inverterpower = data.total.Power.v || 0;
+            let powerMeterPower = data.power_meter.Power.v || 0;
+            let adjustment = Kp * powerMeterPower;
+            let newLimitWatt = inverterpower + adjustment;
+            if (newLimitWatt <30) newLimitWatt = 30; // Wichtig damit der Wechselrichter nicht auf Null gesetzt wird
+            if (newLimitWatt >max_power) newLimitWatt = max_power;
+            let newLimitPercent = (newLimitWatt / max_power) * 100;
+            print("Neues Limit:", newLimitWatt, "Watt");
+            print("powerMeterPower:", powerMeterPower, "Watt");
+            print("InverterPower:", inverterpower, "Watt");
+            print("newLimitPercent:", newLimitPercent, "%");
+            // Vor dem Setzen des neuen Limits den aktuellen Status abfragen
+            getCurrentLimitStatus(newLimitPercent);
+        } else {
+            print("Fehler beim Abrufen der Daten:", response.code);
+        }
+    });
+}
+// **Aktuelles Limit abfragen (ohne Authentifizierung)**
+function getCurrentLimitStatus(newLimitPercent) {
+    Shelly.call("HTTP.GET", { url: limitstatusUrl }, function (response) { 
+        if (response.code >= 200 &&response.code <300) {
+            let limitData;
+            try {
+                limitData = JSON.parse(response.body);
+            } catch (e) {
+                print("Fehler beim JSON-Parsing des Limit-Status:", e);
+                return;
+            }
+            // Prüfen, ob die Seriennummer existiert
+            if (!limitData[serial]) {
+                print("Fehler: Keine Limit-Daten für Seriennummer gefunden.");
+                return;
+            }
+            let currentLimit = limitData[serial].limit_relative || 0;
+            let maxPower = limitData[serial].max_power || 0;
+            let limitStatus = limitData[serial].limit_set_status || "Unbekannt";
+            print("Aktuelles Limit vor Änderung:", currentLimit, "%");
+            //print("Maximale Leistung:", maxPower, "Watt");
+            print("Limit-Set-Status:", limitStatus);
+            // Jetzt das neue Limit setzen
+            sendToOpenDTU(newLimitPercent);
+        } else {
+            print("Fehler beim Abrufen des aktuellen Limits:", response.code);
+        }
+    });
+}
+// **OpenDTU Limit setzen**
+function sendToOpenDTU(newLimitPercent) {
+    let payload = JSON.stringify({
+        serial: serial,
+        limit_type: limit_type,
+        limit_value: newLimitPercent
+    });
+    Shelly.call(
+        "http.request", 
+        {
+            method: "POST",
+            url: openDTUUrl,
+            headers: {
+                "Authorization": auth, // Authentifizierung nur für das Setzen des Limits
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            body: "data="+ payload
+        },
+        function (res, error_code, error_msg) {
+            if (error_code === 0) {
+                print("Limit erfolgreich gesendet:", newLimitPercent, "%");
+            } else {
+                print("Fehler beim Senden an OpenDTU:", error_code, "Nachricht:", error_msg);
+            }
+        }
+    );
+}
+// **Alle 10 Sekunden aktualisieren**
+Timer.set(10000, true, function () {
+    fetchDataAndSend();
+});
+
